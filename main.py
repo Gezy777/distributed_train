@@ -66,14 +66,14 @@ def get_pipeline_model():
     layer_list = build_resnet50_layers()
     total_layer = len(layer_list)
 
-    custom_parts = [0, 14, total_layer]
+    custom_parts = [0, 11, total_layer]
     model = PipelineModule(
         layers=layer_list,
         num_stages=2,  # 2张卡，2个stage
         partition_method=custom_parts,
         loss_fn=torch.nn.CrossEntropyLoss()  # 损失函数，在最后一个stage计算
     )
-    return model
+    return model, custom_parts
 
 if __name__ == "__main__":
     
@@ -105,7 +105,7 @@ if __name__ == "__main__":
         )
 
     # 构建模型
-    model = get_pipeline_model()
+    model, parts = get_pipeline_model()
 
     # 准备数据
     transform = transforms.Compose([

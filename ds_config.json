@@ -27,5 +27,5 @@
     "stages": 2,
     "pipe_partition_method": "custom" 
   },
-  "wall_clock_breakdown": true
+  "wall_clock_breakdown": false
 }

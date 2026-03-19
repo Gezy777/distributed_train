@@ -81,14 +81,14 @@ def get_pipeline_model():
     layer_list = build_resnet50_layers()
     total_layer = len(layer_list)
 
-    custom_parts = [0, 14, total_layer]
+    custom_parts = [0, 11, total_layer]
     model = MyCustomPipelineModule(
         layers=layer_list,
         num_stages=dist.get_world_size(),  # 2张卡，2个stage
-        partition_method=partition,
+        partition_method=custom_parts,
         loss_fn=nn.CrossEntropyLoss()  # 损失函数，在最后一个stage计算
     )
-    return model
+    return model, custom_parts
 
 if __name__ == "__main__":
 
@@ -98,10 +98,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # 初始化 DeepSpeed 分布式环境
-    deepspeed.init_distributed(dist_backend='gloo')
+    deepspeed.init_distributed(dist_backend='nccl')
     
     # 构建模型
-    model = get_pipeline_model()
+    model, parts = get_pipeline_model()
+
+    dist.barrier()
 
     # 初始化 DeepSpeed 引擎
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -124,7 +126,7 @@ if __name__ == "__main__":
             "gradient_accumulation_steps": model_engine.gradient_accumulation_steps(),
             "gpu_nums": dist.get_world_size(),
             "epoch": epochs,
-            "partition": partition
+            "partition": str(parts)
         }
     )
 
