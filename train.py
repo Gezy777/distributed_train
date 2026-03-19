@@ -98,7 +98,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # 初始化 DeepSpeed 分布式环境
-    deepspeed.init_distributed(dist_backend='nccl')
+    deepspeed.init_distributed(dist_backend='gloo')
     
     # 构建模型
     model = get_pipeline_model()
