@@ -114,7 +114,7 @@ if __name__ == "__main__":
 
     swanlab.init(
         project="Resnet50ByPipeline",
-        experiment_name="Resnet50_SingleGPU",
+        experiment_name="Resnet50_TwoNodes",
         description="流水线并行运行Resnet50",
         config={
             "model": "resnet50",
