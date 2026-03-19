@@ -1,0 +1,31 @@
+{
+  "train_batch_size": 256, 
+  "train_micro_batch_size_per_gpu": 32,
+  "gradient_accumulation_steps": 8,
+  "steps_per_print": 10,
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 0.001
+    }
+  },
+  "scheduler": {
+    "type": "WarmupLR",
+    "params": {
+      "warmup_min_lr": 0,
+      "warmup_max_lr": 0.001,
+      "warmup_num_steps": 1000
+    }
+  },
+  "fp16": {
+    "enabled": false
+  },
+  "zero_optimization": {
+    "stage": 1
+  },
+  "pipeline": {
+    "stages": 2,
+    "pipe_partition_method": "custom" 
+  },
+  "wall_clock_breakdown": true
+}
