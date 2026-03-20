@@ -13,7 +13,7 @@ import swanlab
 import torch
 import time
 
-partition = 'uniform'
+partition = 'parameters'
 
 def build_resnet50_layers():
     model = resnet50(pretrained=False)  
@@ -85,7 +85,7 @@ def get_pipeline_model():
     model = MyCustomPipelineModule(
         layers=layer_list,
         num_stages=dist.get_world_size(),  # 2张卡，2个stage
-        partition_method=custom_parts,
+        partition_method=partition,
         loss_fn=nn.CrossEntropyLoss()  # 损失函数，在最后一个stage计算
     )
     return model, custom_parts
@@ -114,9 +114,14 @@ if __name__ == "__main__":
 
     epochs = 50
 
+    if model_engine.is_last_stage():
+        stage = "1"
+    else:
+        stage = "0"
+
     swanlab.init(
         project="Resnet50ByPipeline",
-        experiment_name="Resnet50_TwoNodes",
+        experiment_name="Resnet50_TwoNodes_Stage" + stage, 
         description="流水线并行运行Resnet50",
         config={
             "model": "resnet50",
@@ -126,7 +131,7 @@ if __name__ == "__main__":
             "gradient_accumulation_steps": model_engine.gradient_accumulation_steps(),
             "gpu_nums": dist.get_world_size(),
             "epoch": epochs,
-            "partition": str(parts)
+            "partition": partition
         }
     )
 
@@ -194,6 +199,20 @@ if __name__ == "__main__":
     time_dataloader = time.time()
     print(f"数据加载的时间为{time_dataloader - time_start}")
     time_last = time.time()
+
+    # prof = torch.profiler.profile(
+    #     schedule=torch.profiler.schedule(wait=5, warmup=5, active=10, repeat=1),
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/resnet50_pp/rank{dist.get_rank()}'),
+    #     record_shapes=True,
+    #     with_stack=True,
+    #     activities=[
+    #         torch.profiler.ProfilerActivity.CPU,
+    #         torch.profiler.ProfilerActivity.CUDA,
+    #     ]
+    # )
+
+    # # 启动分析器
+    # prof.start()
     
     for epoch in range(epochs):
         train_sampler.set_epoch(epoch)
@@ -205,7 +224,14 @@ if __name__ == "__main__":
 
         for step in range(train_steps_per_epoch):
             # 执行前向、后向和权重更新
-            loss = model_engine.train_batch(train_iter) 
+            loss = model_engine.train_batch(train_iter)
+
+            # # --- Profiler 步进 ---
+            # if epoch == 0:  # 只在第一个 epoch 记录
+            #     prof.step()
+            #     if step == 50: # 执行完 25 个 step 后可以停止记录以节省性能
+            #         prof.stop()
+
             if model_engine.is_last_stage():
                 if train_step % 10 == 0:
                     print(f"Epoch: {epoch} | Step: {step}/{train_steps_per_epoch} | Loss: {loss:.4f}")

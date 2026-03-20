@@ -1,2 +1,5 @@
 /data
 /swanlog
+/log
+*.txt
+参数量计算.md
