@@ -14,8 +14,8 @@ import torch
 import time
 
 partition = 'parameters'
-bandwidth = "10Gbps"
-latency = "2.5ms"
+bandwidth = "2.5Gbps"
+latency = "5ms"
 
 def build_resnet50_layers():
     model = resnet50(pretrained=False)  
@@ -114,7 +114,7 @@ if __name__ == "__main__":
         model_parameters=model.parameters(),
     )
 
-    epochs = 50
+    epochs = 5
 
     if model_engine.is_last_stage():
         stage = "1"
@@ -124,13 +124,13 @@ if __name__ == "__main__":
     swanlab.init(
         project="Resnet50ByPipeline",
         experiment_name="Resnet50_TwoNodes_Stage" + stage, 
-        description="With micro_batch and gradient_accumulation_steps",
+        description="With no micro_batch and gradient_accumulation_steps",
         config={
             "model": "resnet50",
             "optim": "AdamW",
             "train_batch_size": model_engine.train_batch_size(),
-            "micro_batch_size": model_engine.train_micro_batch_size_per_gpu(),
-            "gradient_accumulation_steps": model_engine.gradient_accumulation_steps(),
+            # "micro_batch_size": # model_engine.train_micro_batch_size_per_gpu(),
+            # "gradient_accumulation_steps": model_engine.gradient_accumulation_steps(),
             "gpu_nums": dist.get_world_size(),
             "epoch": epochs,
             "bandwidth": bandwidth,
@@ -170,8 +170,8 @@ if __name__ == "__main__":
     # 优化： DataLoader 的 batch_size 必须等于 micro_batch_size
     train_loader = DataLoader(
         train_dataset,
-        # batch_size=model_engine.train_batch_size(),
-        batch_size=model_engine.train_micro_batch_size_per_gpu(), 
+        batch_size=model_engine.train_batch_size(),
+        # batch_size=model_engine.train_micro_batch_size_per_gpu(), 
         sampler=train_sampler,
         num_workers=8,
         pin_memory=True,
@@ -180,8 +180,8 @@ if __name__ == "__main__":
 
     test_loader = DataLoader(
         test_dataset,
-        # batch_size=model_engine.train_batch_size(),
-        batch_size=model_engine.train_micro_batch_size_per_gpu(), 
+        batch_size=model_engine.train_batch_size(),
+        # batch_size=model_engine.train_micro_batch_size_per_gpu(), 
         sampler=test_sampler,
         num_workers=8,
         pin_memory=True,
@@ -215,7 +215,7 @@ if __name__ == "__main__":
         
         # 因为每次 train_batch 会消耗 gradient_accumulation_steps 个 micro-batch
         # 所以实际的 steps 需要除以梯度累加步数
-        train_steps_per_epoch = len(train_loader) // model_engine.gradient_accumulation_steps()
+        train_steps_per_epoch = len(train_loader)
 
         for step in range(train_steps_per_epoch):
             # 执行前向、后向和权重更新
@@ -239,7 +239,7 @@ if __name__ == "__main__":
 
 
         model_engine.eval()  # 设置为评估模式
-        test_steps_per_epoch = len(test_loader) // model_engine.gradient_accumulation_steps()
+        test_steps_per_epoch = len(test_loader)
         
         # 获取迭代器
         test_iter = iter(test_loader)
