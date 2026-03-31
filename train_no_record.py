@@ -13,9 +13,12 @@ import swanlab
 import torch
 import time
 
+import threading
+import csv
+import os
+from pynvml import *
 partition = 'parameters'
-bandwidth = "2.5Gbps"
-latency = "5ms"
+epochs_set = 2
 
 def build_resnet50_layers():
     model = resnet50(pretrained=False)  
@@ -114,30 +117,12 @@ if __name__ == "__main__":
         model_parameters=model.parameters(),
     )
 
-    epochs = 5
+    epochs = epochs_set
 
     if model_engine.is_last_stage():
         stage = "1"
     else:
         stage = "0"
-
-    swanlab.init(
-        project="Resnet50ByPipeline",
-        experiment_name="Resnet50_TwoNodes_Stage" + stage, 
-        description="With no micro_batch and gradient_accumulation_steps",
-        config={
-            "model": "resnet50",
-            "optim": "AdamW",
-            "train_batch_size": model_engine.train_batch_size(),
-            # "micro_batch_size": # model_engine.train_micro_batch_size_per_gpu(),
-            # "gradient_accumulation_steps": model_engine.gradient_accumulation_steps(),
-            "gpu_nums": dist.get_world_size(),
-            "epoch": epochs,
-            "bandwidth": bandwidth,
-            "partition": partition,
-            "latency": latency
-        }
-    )
 
     # Rank 0 下载数据集
     if dist.get_rank() == 0:
@@ -154,114 +139,49 @@ if __name__ == "__main__":
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # 2. 测试集/验证集使用标准处理（去掉了 Random 相关的操作）
-    test_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
     train_dataset = datasets.CIFAR10(root='./data', train=True, download=False, transform=train_transform)
-    test_dataset = datasets.CIFAR10(root='./data', train=False, download=False, transform=test_transform)
     train_sampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=1, rank=0)
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, num_replicas=1, rank=0)
 
     # 优化： DataLoader 的 batch_size 必须等于 micro_batch_size
     train_loader = DataLoader(
         train_dataset,
-        batch_size=model_engine.train_batch_size(),
-        # batch_size=model_engine.train_micro_batch_size_per_gpu(), 
+        # batch_size=model_engine.train_batch_size(),
+        batch_size=model_engine.train_micro_batch_size_per_gpu(), 
         sampler=train_sampler,
         num_workers=8,
         pin_memory=True,
         drop_last=True 
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=model_engine.train_batch_size(),
-        # batch_size=model_engine.train_micro_batch_size_per_gpu(), 
-        sampler=test_sampler,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=True
-    )
-
     train_step = 0
     test_step = 0
 
-    time_dataloader = time.time()
-    print(f"数据加载的时间为{time_dataloader - time_start}")
-    time_last = time.time()
-
-    # prof = torch.profiler.profile(
-    #     schedule=torch.profiler.schedule(wait=5, warmup=5, active=10, repeat=1),
-    #     on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/resnet50_pp/rank{dist.get_rank()}'),
-    #     record_shapes=True,
-    #     with_stack=True,
-    #     activities=[
-    #         torch.profiler.ProfilerActivity.CPU,
-    #         torch.profiler.ProfilerActivity.CUDA,
-    #     ]
-    # )
-
-    # # 启动分析器
-    # prof.start()
-    
     for epoch in range(epochs):
+        if model_engine.is_last_stage():
+            print(f"Epoch: {epoch} starts at {time.time()}", flush=True)
         train_sampler.set_epoch(epoch)
         train_iter = iter(train_loader)
+        time_step = []
         
-        # 因为每次 train_batch 会消耗 gradient_accumulation_steps 个 micro-batch
-        # 所以实际的 steps 需要除以梯度累加步数
-        train_steps_per_epoch = len(train_loader)
-
+        train_steps_per_epoch = len(train_loader) // model_engine.gradient_accumulation_steps()
         for step in range(train_steps_per_epoch):
+
+            time_per_step_start = time.time()
             # 执行前向、后向和权重更新
             loss = model_engine.train_batch(train_iter)
+            time_per_step_end = time.time()
+            time_step.append(time_per_step_end - time_per_step_start)
 
-            # # --- Profiler 步进 ---
-            # if epoch == 0:  # 只在第一个 epoch 记录
-            #     prof.step()
-            #     if step == 50: # 执行完 25 个 step 后可以停止记录以节省性能
-            #         prof.stop()
-
-            if model_engine.is_last_stage():
-                if train_step % 10 == 0:
-                    print(f"Epoch: {epoch} | Step: {step}/{train_steps_per_epoch} | Loss: {loss:.4f}")
-                swanlab.log({"train_loss": loss}, step=train_step)
-            train_step += 1
-
-        time_train = time.time()
-        print(f"Epoch{epoch}的训练时间为{(time_train - time_last):.4f}")
-        swanlab.log({"train_time": time_train - time_last}, step=epoch)
-
-
-        model_engine.eval()  # 设置为评估模式
-        test_steps_per_epoch = len(test_loader)
-        
-        # 获取迭代器
-        test_iter = iter(test_loader)
-        
-        with torch.no_grad():
-            for step in range(test_steps_per_epoch):
-                # eval_batch 会自动处理流水线的前向传播过程
-                # 返回的是最后一个 stage 计算出的 loss
-                loss = model_engine.eval_batch(test_iter)
-                
-                if model_engine.is_last_stage():
-                    if step % 5 == 0: # 每 5 个 batch 打印一次，避免刷屏
-                        print(f"[Eval Batch] Epoch: {epoch} | Batch: {step}/{test_steps_per_epoch} | Loss: {loss:.4f}")
-                    swanlab.log({"test_loss": loss}, step=test_step)
-                test_step += 1
-
-        time_test = time.time()
-        print(f"Epoch{epoch}的测试时间为{time_test - time_train}")
-        swanlab.log({"test_time": time_test - time_train}, step=epoch)
-        time_last = time_test
-
-        model_engine.train()  # 恢复训练模式
+            if train_step % 10 == 0:
+                print(
+                    f"Time: {time.time():.4f} | "
+                    f"Stage: {stage} | Epoch: {epoch} | Step: {step}/{train_steps_per_epoch} | "
+                    f"Loss: {loss:.4f} | ",
+                    flush=True
+                )
+            train_step += 1 
+        epoch_time = sum(time_step)
+        if model_engine.is_last_stage():
+            print(f"Epoch: {epoch} ends at {time.time()} | train_time is {epoch_time:.4f}", flush=True)
 
     dist.destroy_process_group()
-    swanlab.finish()
