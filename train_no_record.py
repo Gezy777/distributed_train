@@ -86,11 +86,11 @@ def get_pipeline_model():
     layer_list = build_resnet50_layers()
     total_layer = len(layer_list)
 
-    custom_parts = [0, 11, total_layer]
+    custom_parts = [0, 9, total_layer]
     model = MyCustomPipelineModule(
         layers=layer_list,
         num_stages=dist.get_world_size(),  # 2张卡，2个stage
-        partition_method=partition,
+        partition_method=custom_parts,
         loss_fn=nn.CrossEntropyLoss()  # 损失函数，在最后一个stage计算
     )
     return model, custom_parts
@@ -124,14 +124,8 @@ if __name__ == "__main__":
     else:
         stage = "0"
 
-    # Rank 0 下载数据集
-    if dist.get_rank() == 0:
-        datasets.CIFAR10(root='./data', train=True, download=True)
-    dist.barrier()
-
-    time_start = time.time()
-
-    # 准备数据
+    # 2. 数据预处理
+    data_path = '/home/shaoth/resnet18/data/ILSVRC/Data/CLS-LOC' # 替换为你本地真实的 ImageNet 路径
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
@@ -139,18 +133,22 @@ if __name__ == "__main__":
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = datasets.CIFAR10(root='./data', train=True, download=False, transform=train_transform)
+    train_dataset = datasets.ImageFolder(
+        root=os.path.join(data_path, 'train'), 
+        transform=train_transform
+    )
     train_sampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=1, rank=0)
 
     # 优化： DataLoader 的 batch_size 必须等于 micro_batch_size
     train_loader = DataLoader(
         train_dataset,
-        # batch_size=model_engine.train_batch_size(),
-        batch_size=model_engine.train_micro_batch_size_per_gpu(), 
+        batch_size=model_engine.train_batch_size(),
         sampler=train_sampler,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=True 
+        num_workers=16,          # 增加到 16 或更多，取决于你的 CPU 核心数
+        pin_memory=True,         # 必须为 True，加速从内存到显存的拷贝
+        drop_last=True,
+        prefetch_factor=4,       # 关键：强制每个 worker 提前准备 4 个 batch
+        persistent_workers=True  # 保持 worker 进程不销毁，减少每个 Epoch 开始时的卡顿
     )
 
     train_step = 0
@@ -163,7 +161,7 @@ if __name__ == "__main__":
         train_iter = iter(train_loader)
         time_step = []
         
-        train_steps_per_epoch = len(train_loader) // model_engine.gradient_accumulation_steps()
+        train_steps_per_epoch = len(train_loader)
         for step in range(train_steps_per_epoch):
 
             time_per_step_start = time.time()

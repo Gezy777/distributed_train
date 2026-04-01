@@ -1,24 +1,21 @@
-from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms, datasets
-from deepspeed.pipe import PipelineModule
-from torchvision.models import resnet50
-from torch.utils.data import DataLoader
-from deepspeed.runtime.pipe.module import LayerSpec
-
-import torch.distributed as dist
+import torch
 import torch.nn as nn
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torchvision.models import resnet50
+from torch.utils.data.distributed import DistributedSampler
+from deepspeed.pipe import PipelineModule
 import deepspeed
 import argparse
-import torch
+import os
+from deepspeed.runtime.pipe.module import LayerSpec
+import torch.distributed as dist
+import csv
 import time
 
-import threading
-import csv
-import os
-partition = 'parameters'
-epochs_set = 5
-log_dir = "./logs/parameters_B32S8"
 from pynvml import *
+log_dir = os.environ.get("LOG_DIR", "default_log")
+log_dir = "./pipeline/" + log_dir
 
 class GlobalGPUMonitor(threading.Thread):
     def __init__(self, gpu_indices=[0, 1], interval=0.1, log_dir=log_dir):
@@ -127,52 +124,31 @@ def get_pipeline_model():
     layer_list = build_resnet50_layers()
     total_layer = len(layer_list)
 
-    custom_parts = [0, 9, total_layer]
+    custom_parts = [0, 11, total_layer]
     model = MyCustomPipelineModule(
         layers=layer_list,
         num_stages=dist.get_world_size(),  # 2张卡，2个stage
-        partition_method=custom_parts,
+        partition_method='uniform',
         loss_fn=nn.CrossEntropyLoss()  # 损失函数，在最后一个stage计算
     )
     return model, custom_parts
 
-if __name__ == "__main__":
-
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_rank', type=int, default=0, help='local rank passed from distributed launcher')
+    parser.add_argument('--local_rank', type=int, default=-1)
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
-    
-    # 初始化 DeepSpeed 分布式环境
-    deepspeed.init_distributed(dist_backend='nccl')
-    
-    # 构建模型
+
+    # 初始化分布式环境
+    deepspeed.init_distributed()
+
+    # 2. 构建流水线模型
+    # num_stages=2 会将层自动切分到两张显卡上
     model, parts = get_pipeline_model()
 
-    dist.barrier()
 
-    # 初始化 DeepSpeed 引擎
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=model.parameters(),
-    )
-
-    epochs = epochs_set
-
-    if model_engine.is_last_stage():
-        stage = "1"
-    else:
-        stage = "0"
-
-    # Rank 0 下载数据集
-    if dist.get_rank() == 0:
-        datasets.CIFAR10(root='./data', train=True, download=True)
-    dist.barrier()
-
-    time_start = time.time()
-
-    # 准备数据
+    # 3. 数据预处理
+    data_path = '/home/shaoth/resnet18/data/ILSVRC/Data/CLS-LOC'
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
@@ -180,84 +156,70 @@ if __name__ == "__main__":
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # 2. 测试集/验证集使用标准处理（去掉了 Random 相关的操作）
-    test_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    train_dataset = datasets.ImageFolder(root=os.path.join(data_path, 'train'), transform=train_transform)
 
-    train_dataset = datasets.CIFAR10(root='./data', train=True, download=False, transform=train_transform)
-    test_dataset = datasets.CIFAR10(root='./data', train=False, download=False, transform=test_transform)
-    train_sampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=1, rank=0)
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, num_replicas=1, rank=0)
-
-    # 优化： DataLoader 的 batch_size 必须等于 micro_batch_size
-    train_loader = DataLoader(
-        train_dataset,
-        # batch_size=model_engine.train_batch_size(),
-        batch_size=model_engine.train_micro_batch_size_per_gpu(), 
-        sampler=train_sampler,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=True 
+    # 4. 初始化 DeepSpeed
+    # 注意：Pipeline 模式下，model_parameters 必须传 model.parameters()
+    model_engine, optimizer, _, _ = deepspeed.initialize(
+        args=args,
+        model=model,
+        model_parameters=[p for p in model.parameters() if p.requires_grad]
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        # batch_size=model_engine.train_batch_size(),
-        batch_size=model_engine.train_micro_batch_size_per_gpu(), 
-        sampler=test_sampler,
-        num_workers=8,
+    # 5. 数据加载 (PP 模式下 sampler 的 rank 处理)
+    train_sampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=1, rank=0)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=model_engine.train_micro_batch_size_per_gpu(),
+        sampler=train_sampler,
+        num_workers=12,
         pin_memory=True,
         drop_last=True
     )
 
-    train_step = 0
-    test_step = 0
-
-    if model_engine.is_last_stage():
-        monitor = GlobalGPUMonitor(interval=0.1)
-        monitor.start()
+    monitor = GlobalGPUMonitor(interval=0.1)
+    monitor.start()
     nvmlInit()
     handle = nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
 
-    for epoch in range(epochs):
-        if model_engine.is_last_stage():
-            print(f"Epoch: {epoch} starts at {time.time()}", flush=True)
-        train_sampler.set_epoch(epoch)
-        train_iter = iter(train_loader)
-        time_step = []
-        
-        train_steps_per_epoch = len(train_loader) // model_engine.gradient_accumulation_steps()
-        for step in range(train_steps_per_epoch):
+    # 6. 流水线训练循环
+    model_engine.train()
 
+    for epoch in range(100):
+        train_sampler.set_epoch(epoch)
+        # 将 dataloader 转换为可迭代对象
+        data_iter = iter(train_loader)
+        # 计算全局 Step 的数量
+        gas = model_engine.gradient_accumulation_steps()
+        total_steps = len(train_loader) // gas
+        
+        for step in range(total_steps):
+            # train_batch 内部会自动处理 Forward, Backward, Step
+            # 它会自动在 Stage 0 读取数据，在 Stage 1 计算 Loss
             time_per_step_start = time.time()
             # 执行前向、后向和权重更新
-            loss = model_engine.train_batch(train_iter)
-            time_per_step_end = time.time()
-            time_step.append(time_per_step_end - time_per_step_start)
+            loss = model_engine.train_batch(data_iter)
+            time_per_step_end = time.time()    
+            sample_s = model_engine.train_batch_size() / (time_per_step_end - time_per_step_start) 
+            util = nvmlDeviceGetUtilizationRates(handle)
+            mem = nvmlDeviceGetMemoryInfo(handle)              
+            gpu_util = util.gpu
+            mem_used_mb = mem.used / 1024**2
+            mem_util_pct = (mem.used / mem.total) * 100  
+            if step % 5 == 0 :
+                if model_engine.is_last_stage():
+                    print(f"Time: {time.time():.4f} | Epoch: {epoch} | Step: {step} / {total_steps} | Loss: {loss.item():.4f} | Sample/sec: {sample_s:.1f}",
+                        flush=True)
+                stage = 1 if model_engine.is_last_stage() else 0
+                print(f"Stage {stage} | GPU Util: {gpu_util}% | Mem: {mem_used_mb:.2f}MB | Mem Util: {mem_util_pct:.2f}%",
+                    flush=True)
 
-            if train_step % 10 == 0:
-                util = nvmlDeviceGetUtilizationRates(handle)
-                mem = nvmlDeviceGetMemoryInfo(handle)              
-                gpu_util = util.gpu
-                mem_used_mb = mem.used / 1024**2
-                mem_util_pct = (mem.used / mem.total) * 100  
-                print(
-                    f"Time: {time.time():.4f} | "
-                    f"Stage: {stage} | Epoch: {epoch} | Step: {step}/{train_steps_per_epoch} | "
-                    f"Loss: {loss:.4f} | "
-                    f"GPU Util: {gpu_util}% | Mem: {mem_used_mb:.2f}MB | Mem Util: {mem_util_pct:.2f}%",
-                    flush=True
-                )
-            train_step += 1 
-        epoch_time = sum(time_step)
-        if model_engine.is_last_stage():
-            print(f"Epoch: {epoch} ends at {time.time()} | train_time is {epoch_time:.4f}", flush=True)
 
-    dist.destroy_process_group()
-    if model_engine.is_last_stage():
-        monitor.stop()
-        monitor.join()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    monitor.stop()
+    monitor.join()
+
+
+if __name__ == "__main__":
+    main()

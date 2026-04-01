@@ -4,3 +4,5 @@
 *.txt
 参数量计算.md
 logs
+*.log
+pipeline

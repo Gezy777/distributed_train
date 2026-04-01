@@ -1,0 +1,1 @@
+deepspeed --num_gpus=2 singleGPU.py --deepspeed_config dds_config.json 2>&1 | tee ./dp2.log
