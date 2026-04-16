@@ -156,15 +156,15 @@ if __name__ == "__main__":
     else:
         stage = "0"
 
-    # experiment_name = os.environ["experiment_name"]
-    # if experiment_name == "SingleNode":
-    #     experiment_name = "Resnet50_SingleNode"
-    # elif experiment_name == "TwoNodes":
-    #     experiment_name = "Resnet50_TwoNodes_Stage" + stage
+    experiment_name = os.environ["experiment_name"]
+    if experiment_name == "SingleNode":
+        experiment_name = "Resnet50_SingleNode"
+    elif experiment_name == "TwoNodes":
+        experiment_name = "Resnet50_TwoNodes_Stage" + stage
 
     swanlab.init(
         project="Resnet50ByPipeline",
-        experiment_name="Resnet50_TwoNodes_Stage" + stage, 
+        experiment_name=experiment_name, 
         description="With micro_batch and gradient_accumulation_steps",
         config={
             "model": "resnet50",
